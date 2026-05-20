@@ -34,6 +34,12 @@
         "default": 5,
         "hint": "备注字段最多保留的条目数，超出时旧记录会被挤掉。"
     },
+    "max_note_length": {
+        "description": "单条备注最大字数",
+        "type": "int",
+        "default": 50,
+        "hint": "每条备注（含代录人标注）的最大字符数。"
+    },
     "admin_permission_denied_msg": {
         "description": "管理员命令权限不足提示",
         "type": "string",
@@ -43,8 +49,8 @@
     "profile_prompt": {
         "description": "画像系统提示词",
         "type": "text",
-        "default": "<用户画像系统>\n<当前画像>\n{profile_summary}\n</当前画像>\n<可用字段>{allowed_fields_display}</可用字段>\n\n【核心规则】\n★ 仅在用户主动提及相关话题时，才使用画像中的信息 ★\n\n<记录规则>\n1. 用户主动提及时自动记录，不刻意套话、不主动询问\n2. 更新备注之外的消息时带上旧信息一起覆写，如：用户之前爱吃火锅，现在说也喜欢奶茶→[Profile: 爱吃=火锅、奶茶]\n3. 备注字段：每条不超过20字，用分号分隔，系统自动保留最近{max_notes_count}条，显示为1.xxx 2.xxx格式，你不需要输出编号，编号会自动填写，也不需要重复之前的信息\n4.优先把信息填入已有的字段，再考虑填入备注，因为备注不是永久保存的。\n5.每次回复中，同一个字段只输出一条最终结果的标记，不要输出中间步骤或重复标记。如需先删后写，只输出一个[ProfileDelete]和一个[Profile]即可。\n</记录规则>\n\n<输出格式>\n记录/更新：[Profile: 字段=值] 或 [Profile: 对用户的称呼=小明, 性别=女]\n删除备注条目：[ProfileDelete: 条目编号] 如 [ProfileDelete: 1] 或 [ProfileDelete: 1, 2]\n删除整个字段：[ProfileDelete: 字段名] 如 [ProfileDelete: 对用户的称呼]\n</输出格式>\n</用户画像系统>",
-        "hint": "支持变量：{profile_summary}当前画像摘要、{allowed_fields_display}可用字段列表、{max_notes_count}备注保留条数"
+        "default": "<用户画像系统>\n<当前发言者>ID={sender_id}，昵称={sender_nickname}</当前发言者>\n<当前发言者画像>\n{profile_summary}\n</当前发言者画像>\n<对话中其他相关用户画像>\n{other_profiles_summary}\n</对话中其他相关用户画像>\n<可用字段>{allowed_fields_display}</可用字段>\n\n【核心规则】\n1. 对当前发言者：在聊天中自然运用其画像；对他人：当消息 @ 了某人、出现 QQ 号、或用户明确要求帮某人备注时，可运用并更新对应用户的画像。\n2. 称呼/昵称要积极记录：用户自我介绍、被他人称呼、群名片/昵称可见时，应写入「对用户的称呼」，不必等用户专门说「请记住」。\n\n<记录规则>\n1. 当前用户自己透露的信息 → [Profile: 字段=值]\n2. 帮他人备注（含 @某人、QQ号、如「帮QQ123备注…」）→ [ProfileFor: 目标QQ或用户ID, 字段=值]\n3. 更新非备注字段时带上旧信息覆写，如爱吃火锅后又说喜欢奶茶→[Profile: 爱吃=火锅、奶茶]\n4. 备注字段：用分号分隔多条，系统保留最近{max_notes_count}条；代录的备注会自动标注代录人\n5. 优先填入已有字段，再考虑备注\n6. 同一字段只输出一条最终标记\n</记录规则>\n\n<输出格式>\n本人：[Profile: 对用户的称呼=小明, 兽设=狐狸]\n代录：[ProfileFor: 1346990486, 对用户的称呼=曲奇, 兽设=狗狗龙]\n删除备注：[ProfileDelete: 1]  删除字段：[ProfileDelete: 生日]\n</输出格式>\n</用户画像系统>",
+        "hint": "变量：{profile_summary}{allowed_fields_display}{max_notes_count}{sender_id}{sender_nickname}{other_profiles_summary}"
     },
     "allow_profile_in_group": {
         "description": "允许在群聊中查看画像",
