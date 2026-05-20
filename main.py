@@ -354,6 +354,75 @@ class SoulMapPlugin(Star):
                 result = result.replace("{" + key + "}", str(val))
             return result
 
+    def _strip_command_prefix(self, event: AstrMessageEvent, command_name: str) -> str:
+        """去掉指令名前缀，返回剩余参数字符串"""
+        text = (getattr(event, "message_str", None) or "").strip()
+        if not text:
+            try:
+                parts = []
+                for comp in event.get_messages():
+                    if isinstance(comp, Plain) and comp.text:
+                        parts.append(comp.text)
+                text = "".join(parts).strip()
+            except Exception:
+                text = ""
+        for prefix in (f"/{command_name}", command_name):
+            if text.startswith(prefix):
+                return text[len(prefix) :].strip()
+        return text
+
+    def _parse_proxy_record_args(
+        self, event: AstrMessageEvent
+    ) -> Optional[Tuple[str, str, str]]:
+        """
+        解析代录画像参数，支持：
+        - 1346990486 对用户的称呼 曲奇
+        - 1346990486 对用户的称呼=曲奇
+        - 1346990486 兽设=狗狗龙
+        """
+        rest = self._strip_command_prefix(event, "代录画像")
+        if not rest:
+            return None
+
+        # 首段为目标 QQ（支持 @123）
+        head_match = re.match(r"^@?(\d{5,12})\s*(.*)$", rest, re.DOTALL)
+        if not head_match:
+            return None
+        target_id, body = head_match.group(1), head_match.group(2).strip()
+        if not body:
+            return None
+
+        if "=" in body and not body.startswith("="):
+            field, _, value = body.partition("=")
+            field, value = field.strip(), value.strip()
+            if field and value:
+                return target_id, field, value
+
+        for field in sorted(self.manager.allowed_fields, key=len, reverse=True):
+            if body == field:
+                return None
+            if body.startswith(field + " "):
+                value = body[len(field) :].strip()
+                if value:
+                    return target_id, field, value
+
+        sub = body.split(None, 1)
+        if len(sub) == 2 and sub[0] and sub[1]:
+            return target_id, sub[0], sub[1]
+        return None
+
+    def _proxy_record_help_text(self) -> str:
+        fields = self._get_allowed_fields_display()
+        return (
+            "用法：代录画像 <QQ号> <字段> <内容>\n"
+            "或：代录画像 <QQ号> <字段>=<内容>\n\n"
+            "示例：\n"
+            "• 代录画像 1346990486 对用户的称呼 曲奇\n"
+            "• 代录画像 1346990486 兽设=狗狗龙\n"
+            "• 代录画像 1346990486 备注 喜欢画画\n\n"
+            f"可用字段：{fields}"
+        )
+
     @filter.on_llm_request()
     async def add_profile_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """注入画像信息"""
@@ -555,19 +624,14 @@ class SoulMapPlugin(Star):
             yield event.plain_result("你还没有任何画像数据")
 
     @filter.command("代录画像")
-    async def proxy_record_profile(
-        self,
-        event: AstrMessageEvent,
-        target_id: str,
-        field: str,
-        value: str,
-    ):
-        """
-        为他人记录画像。示例：代录画像 1346990486 对用户的称呼 曲奇
-        """
-        target_id = target_id.strip().lstrip("@")
-        field = field.strip()
-        value = value.strip()
+    async def proxy_record_profile(self, event: AstrMessageEvent):
+        """为他人记录画像（从整条消息解析参数，避免多参数指令解析失败）"""
+        parsed = self._parse_proxy_record_args(event)
+        if not parsed:
+            yield event.plain_result(self._proxy_record_help_text())
+            return
+
+        target_id, field, value = parsed
         session_id = self._get_session_id(event)
         contributor = self._get_contributor_label(event)
 
