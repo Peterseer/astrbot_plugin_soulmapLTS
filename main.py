@@ -18,6 +18,27 @@ FIELD_VALUE_PATTERN = re.compile(
     r"([\w\u4e00-\u9fff/]+)\s*=\s*([^,，]*(?:[,，](?!\s*[\w\u4e00-\u9fff/]+=)[^,，]*)*)"
 )
 
+# 与 README / _conf_schema 保持一致的默认字段（单一来源）
+DEFAULT_ALLOWED_FIELDS = [
+    "对用户的称呼",
+    "性别",
+    "年龄",
+    "所在地",
+    "兽设",
+    "生日",
+    "爱吃",
+    "忌口",
+    "爱好",
+    "职业",
+    "重要节日",
+    "恐惧/弱点",
+    "作息规律",
+    "技能水平",
+    "健康状况",
+    "宠物",
+    "备注",
+]
+
 
 class SoulMapManager:
     """
@@ -228,28 +249,15 @@ class SoulMapPlugin(Star):
 
         data_dir = StarTools.get_data_dir()
 
-        allowed_fields = self.config.get(
-            "allowed_fields",
-            [
-                "对用户的称呼",
-                "性别",
-                "年龄",
-                "所在地",
-                "兽设",
-                "生日",
-                "爱吃",
-                "忌口",
-                "爱好",
-                "职业",
-                "重要节日",
-                "恐惧/弱点",
-                "作息规律",
-                "技能水平",
-                "健康状况",
-                "宠物",
-                "备注",
-            ],
-        )
+        configured_fields = self.config.get("allowed_fields")
+        if configured_fields:
+            allowed_fields = list(configured_fields)
+            missing = [f for f in DEFAULT_ALLOWED_FIELDS if f not in allowed_fields]
+            if missing:
+                allowed_fields.extend(missing)
+                logger.info(f"[SoulMap] 已向 allowed_fields 补全缺失字段: {missing}")
+        else:
+            allowed_fields = list(DEFAULT_ALLOWED_FIELDS)
         max_notes_count = self.config.get("max_notes_count", 5)
         max_note_length = self.config.get("max_note_length", 50)
 
