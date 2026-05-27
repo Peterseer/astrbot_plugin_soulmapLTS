@@ -271,12 +271,22 @@ class SoulMapManager:
         matched: List[str] = []
         seen: Set[str] = set()
         for user_id, profile in self._iter_profiles_for_session(session_id):
-            alias = str(profile.get("对用户的称呼", "")).strip()
-            if len(alias) < 2:  # 避免单字称呼导致误匹配
+            raw_alias = str(profile.get("对用户的称呼", "")).strip()
+            if not raw_alias:
                 continue
-            if alias in normalized and user_id not in seen:
-                seen.add(user_id)
-                matched.append(user_id)
+            # 允许一个用户存多个称呼：如“皮卡麦/麦麦；皮卡”
+            aliases = [
+                a.strip()
+                for a in re.split(r"[，,、/／|；;\n]+", raw_alias)
+                if a and a.strip()
+            ]
+            for alias in aliases:
+                if len(alias) < 2:  # 避免单字称呼导致误匹配
+                    continue
+                if alias in normalized and user_id not in seen:
+                    seen.add(user_id)
+                    matched.append(user_id)
+                    break
         return matched
 
 
@@ -386,11 +396,19 @@ class SoulMapPlugin(Star):
         except Exception:
             pass
 
+        message_str = (getattr(event, "message_str", None) or "").strip()
+        if message_str:
+            for uid in self._extract_user_ids_from_text(message_str):
+                add(uid)
+
         # 称呼关键词反查：例如“我希望皮卡麦去…”
-        keyword_text = f"{plain_text}\n{outline}".strip()
-        for uid in self.manager.find_user_ids_by_name_keywords(keyword_text, self._get_session_id(event)):
+        keyword_text = f"{plain_text}\n{outline}\n{message_str}".strip()
+        for uid in self.manager.find_user_ids_by_name_keywords(
+            keyword_text, self._get_session_id(event)
+        ):
             add(uid)
 
+        logger.debug(f"[SoulMap] 关联用户识别结果: {related}, keyword_text={keyword_text[:120]}")
         return related
 
     def _parse_field_pairs(self, match_text: str) -> List[Tuple[str, str]]:
