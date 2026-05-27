@@ -40,6 +40,36 @@ DEFAULT_ALLOWED_FIELDS = [
     "备注",
 ]
 
+DEFAULT_PROFILE_PROMPT = """<用户画像系统>
+<当前发言者>ID={sender_id}，昵称={sender_nickname}</当前发言者>
+<当前发言者画像>
+{profile_summary}
+</当前发言者画像>
+<对话中其他相关用户画像>
+{other_profiles_summary}
+</对话中其他相关用户画像>
+<可用字段>{allowed_fields_display}</可用字段>
+
+【核心规则】
+1. 对当前发言者：在聊天中自然运用其画像；对他人：当消息出现 @某人、ID:123、QQ号123、纯QQ数字，或命中他人的称呼关键词时，可运用并更新对应用户的画像。
+2. 称呼/昵称要积极记录：用户自我介绍、被他人称呼、群名片/昵称可见时，应写入「对用户的称呼」，不必等用户专门说「请记住」。
+
+<记录规则>
+1. 当前用户自己透露的信息 → [Profile: 字段=值]
+2. 帮他人备注（含 @某人、ID/QQ号、称呼关键词、如「帮QQ123备注…」）→ [ProfileFor: 目标QQ或用户ID, 字段=值]
+3. 更新非备注字段时带上旧信息覆写，如爱吃火锅后又说喜欢奶茶→[Profile: 爱吃=火锅、奶茶]
+4. 备注字段：用分号分隔多条，系统保留最近{max_notes_count}条；代录的备注会自动标注代录人
+5. 优先填入已有字段，再考虑备注
+6. 同一字段只输出一条最终标记
+</记录规则>
+
+<输出格式>
+本人：[Profile: 对用户的称呼=小明, 兽设=狐狸]
+代录：[ProfileFor: 1346990486, 对用户的称呼=曲奇, 兽设=狗狗龙]
+删除备注：[ProfileDelete: 1]  删除字段：[ProfileDelete: 生日]
+</输出格式>
+</用户画像系统>"""
+
 
 class SoulMapManager:
     """
@@ -357,21 +387,24 @@ class SoulMapPlugin(Star):
                     found.add(g)
         return found
 
-    def _collect_related_user_ids(self, event: AstrMessageEvent) -> List[str]:
-        """从 @ 组件与消息文本中的 QQ 号收集相关用户 ID"""
-        related: List[str] = []
-        seen: Set[str] = set()
+    def _collect_related_user_ids_with_sources(
+        self, event: AstrMessageEvent
+    ) -> Dict[str, List[str]]:
+        """收集相关用户 ID，并记录命中来源。"""
+        sources: Dict[str, Set[str]] = {}
 
-        def add(uid: str):
+        def add(uid: str, source: str):
             uid = str(uid).strip()
-            if uid and uid not in seen:
-                seen.add(uid)
-                related.append(uid)
+            if not uid:
+                return
+            if uid not in sources:
+                sources[uid] = set()
+            sources[uid].add(source)
 
         try:
             for comp in event.get_messages():
                 if isinstance(comp, At) and getattr(comp, "qq", None):
-                    add(str(comp.qq))
+                    add(str(comp.qq), "At组件")
         except Exception:
             pass
 
@@ -382,9 +415,8 @@ class SoulMapPlugin(Star):
                 if isinstance(comp, Plain) and comp.text:
                     plain_parts.append(comp.text)
             plain_text = "".join(plain_parts)
-            add_from_text = self._extract_user_ids_from_text(plain_text)
-            for uid in add_from_text:
-                add(uid)
+            for uid in self._extract_user_ids_from_text(plain_text):
+                add(uid, "Plain文本ID")
         except Exception:
             pass
 
@@ -392,23 +424,30 @@ class SoulMapPlugin(Star):
         try:
             outline = event.get_message_outline() or ""
             for uid in self._extract_user_ids_from_text(outline):
-                add(uid)
+                add(uid, "消息Outline ID")
         except Exception:
             pass
 
         message_str = (getattr(event, "message_str", None) or "").strip()
         if message_str:
             for uid in self._extract_user_ids_from_text(message_str):
-                add(uid)
+                add(uid, "message_str ID")
 
-        # 称呼关键词反查：例如“我希望皮卡麦去…”
         keyword_text = f"{plain_text}\n{outline}\n{message_str}".strip()
         for uid in self.manager.find_user_ids_by_name_keywords(
             keyword_text, self._get_session_id(event)
         ):
-            add(uid)
+            add(uid, "称呼关键词")
 
-        logger.debug(f"[SoulMap] 关联用户识别结果: {related}, keyword_text={keyword_text[:120]}")
+        return {uid: sorted(list(srcs)) for uid, srcs in sources.items()}
+
+    def _collect_related_user_ids(self, event: AstrMessageEvent) -> List[str]:
+        """从 @ 组件与消息文本中的 QQ 号收集相关用户 ID"""
+        related = list(self._collect_related_user_ids_with_sources(event).keys())
+        message_str = (getattr(event, "message_str", None) or "").strip()
+        logger.debug(
+            f"[SoulMap] 关联用户识别结果: {related}, message_str={message_str[:120]}"
+        )
         return related
 
     def _parse_field_pairs(self, match_text: str) -> List[Tuple[str, str]]:
@@ -511,18 +550,20 @@ class SoulMapPlugin(Star):
         allowed_fields_display = self._get_allowed_fields_display()
         max_notes_count = str(self.config.get("max_notes_count", 5))
 
-        profile_prompt = self.config.get("profile_prompt", "")
-        if profile_prompt:
-            profile_prompt = self._format_profile_prompt(
-                profile_prompt,
-                profile_summary=profile_summary,
-                allowed_fields_display=allowed_fields_display,
-                max_notes_count=max_notes_count,
-                sender_id=str(user_id),
-                sender_nickname=sender_nickname or "未知",
-                other_profiles_summary=other_profiles_summary,
-            )
-            req.system_prompt += f"\n{profile_prompt}"
+        profile_prompt = self.config.get("profile_prompt")
+        if not profile_prompt:
+            profile_prompt = DEFAULT_PROFILE_PROMPT
+
+        profile_prompt = self._format_profile_prompt(
+            profile_prompt,
+            profile_summary=profile_summary,
+            allowed_fields_display=allowed_fields_display,
+            max_notes_count=max_notes_count,
+            sender_id=str(user_id),
+            sender_nickname=sender_nickname or "未知",
+            other_profiles_summary=other_profiles_summary,
+        )
+        req.system_prompt += f"\n{profile_prompt}"
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -781,6 +822,30 @@ class SoulMapPlugin(Star):
             response += f"• {field}: {count} ({rate:.1f}%)\n"
 
         yield event.plain_result(response)
+
+    @filter.command("调试画像匹配")
+    async def debug_profile_match(self, event: AstrMessageEvent):
+        """调试本条消息触发的画像匹配结果。"""
+        session_id = self._get_session_id(event)
+        source_map = self._collect_related_user_ids_with_sources(event)
+
+        if not source_map:
+            yield event.plain_result(
+                "🔍 调试画像匹配：未识别到相关用户ID。\n"
+                "可尝试使用 @某人、ID:12345、QQ号12345 或已记录称呼关键词。"
+            )
+            return
+
+        lines = [f"🔍 调试画像匹配（共 {len(source_map)} 人）"]
+        for uid, sources in source_map.items():
+            summary = self.manager.format_profile_summary(uid, session_id)
+            lines.append(f"\n【ID {uid}】来源：{', '.join(sources)}")
+            if summary == "暂无记录":
+                lines.append("- 画像：暂无记录")
+            else:
+                lines.append(summary)
+
+        yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         self.manager._save_data()
