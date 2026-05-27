@@ -10,9 +10,9 @@ from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.message_components import Plain, At
 
-# 从消息文本中识别 QQ 号（QQ123、qq:123、纯数字等）
-QQ_IN_TEXT_PATTERN = re.compile(
-    r"(?:QQ|qq)[:\s]*(\d{5,12})|@(\d{5,12})\b|(?:^|[\s,，])(\d{8,12})(?:[\s,，]|$)"
+# 从消息文本中识别用户 ID（ID:xxx / QQ号xxx / @123 / 纯数字）
+USER_ID_IN_TEXT_PATTERN = re.compile(
+    r"(?:\bID\b|id|QQ号|qq号|QQ|qq)[:：#\s]*([1-9]\d{4,12})|@([1-9]\d{4,12})\b|(?:^|[^\d])([1-9]\d{7,11})(?!\d)"
 )
 FIELD_VALUE_PATTERN = re.compile(
     r"([\w\u4e00-\u9fff/]+)\s*=\s*([^,，]*(?:[,，](?!\s*[\w\u4e00-\u9fff/]+=)[^,，]*)*)"
@@ -241,6 +241,44 @@ class SoulMapManager:
     def export_all_profiles(self) -> Dict[str, Any]:
         return self.user_data.copy()
 
+    def _iter_profiles_for_session(
+        self, session_id: Optional[str] = None
+    ) -> List[Tuple[str, Dict[str, Any]]]:
+        """遍历当前会话可见的画像，返回 (user_id, profile) 列表。"""
+        rows: List[Tuple[str, Dict[str, Any]]] = []
+        for key, profile in self.user_data.items():
+            if not isinstance(profile, dict):
+                continue
+            if session_id:
+                prefix = f"{session_id}_"
+                if not key.startswith(prefix):
+                    continue
+                user_id = key[len(prefix) :]
+            else:
+                user_id = key
+            if user_id:
+                rows.append((str(user_id), profile))
+        return rows
+
+    def find_user_ids_by_name_keywords(
+        self, text: str, session_id: Optional[str] = None
+    ) -> List[str]:
+        """根据消息文本中的称呼关键词，反查可能的用户 ID。"""
+        normalized = (text or "").strip()
+        if not normalized:
+            return []
+
+        matched: List[str] = []
+        seen: Set[str] = set()
+        for user_id, profile in self._iter_profiles_for_session(session_id):
+            alias = str(profile.get("对用户的称呼", "")).strip()
+            if len(alias) < 2:  # 避免单字称呼导致误匹配
+                continue
+            if alias in normalized and user_id not in seen:
+                seen.add(user_id)
+                matched.append(user_id)
+        return matched
+
 
 @register("SoulMap", "柯尔", "AI驱动的用户画像收集系统，简洁设计，AI负责数据管理", "1.2.0")
 class SoulMapPlugin(Star):
@@ -301,9 +339,9 @@ class SoulMapPlugin(Star):
             return f"{nickname}/{sender_id}"
         return str(sender_id)
 
-    def _extract_qq_from_text(self, text: str) -> Set[str]:
+    def _extract_user_ids_from_text(self, text: str) -> Set[str]:
         found: Set[str] = set()
-        for m in QQ_IN_TEXT_PATTERN.finditer(text or ""):
+        for m in USER_ID_IN_TEXT_PATTERN.finditer(text or ""):
             for g in m.groups():
                 if g:
                     found.add(g)
@@ -327,24 +365,31 @@ class SoulMapPlugin(Star):
         except Exception:
             pass
 
+        plain_text = ""
         try:
             plain_parts = []
             for comp in event.get_messages():
                 if isinstance(comp, Plain) and comp.text:
                     plain_parts.append(comp.text)
-            add_from_text = self._extract_qq_from_text("".join(plain_parts))
-            for qq in add_from_text:
-                add(qq)
+            plain_text = "".join(plain_parts)
+            add_from_text = self._extract_user_ids_from_text(plain_text)
+            for uid in add_from_text:
+                add(uid)
         except Exception:
             pass
 
-        if not related:
-            try:
-                outline = event.get_message_outline() or ""
-                for qq in self._extract_qq_from_text(outline):
-                    add(qq)
-            except Exception:
-                pass
+        outline = ""
+        try:
+            outline = event.get_message_outline() or ""
+            for uid in self._extract_user_ids_from_text(outline):
+                add(uid)
+        except Exception:
+            pass
+
+        # 称呼关键词反查：例如“我希望皮卡麦去…”
+        keyword_text = f"{plain_text}\n{outline}".strip()
+        for uid in self.manager.find_user_ids_by_name_keywords(keyword_text, self._get_session_id(event)):
+            add(uid)
 
         return related
 
