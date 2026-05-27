@@ -48,11 +48,15 @@ DEFAULT_PROFILE_PROMPT = """<用户画像系统>
 <对话中其他相关用户画像>
 {other_profiles_summary}
 </对话中其他相关用户画像>
+<称呼-用户ID映射（来自SoulMap）>
+{alias_index_summary}
+</称呼-用户ID映射（来自SoulMap）>
 <可用字段>{allowed_fields_display}</可用字段>
 
 【核心规则】
 1. 对当前发言者：在聊天中自然运用其画像；对他人：当消息出现 @某人、ID:123、QQ号123、纯QQ数字，或命中他人的称呼关键词时，可运用并更新对应用户的画像。
 2. 称呼/昵称要积极记录：用户自我介绍、被他人称呼、群名片/昵称可见时，应写入「对用户的称呼」，不必等用户专门说「请记住」。
+3. 在群聊中遇到“谁是XX / 找到XX / XX是谁”等找人请求时，若工具可用，请优先调用 `get_group_members_info` 获取群成员 user_id、display_name、username，再与“称呼-用户ID映射”做交叉匹配后回答。
 
 <记录规则>
 1. 当前用户自己透露的信息 → [Profile: 字段=值]
@@ -319,6 +323,20 @@ class SoulMapManager:
                     break
         return matched
 
+    def format_alias_index_summary(
+        self, session_id: Optional[str] = None, max_rows: int = 80
+    ) -> str:
+        """输出称呼到用户ID的简要索引，便于LLM结合群成员工具做匹配。"""
+        rows: List[str] = []
+        for user_id, profile in self._iter_profiles_for_session(session_id):
+            alias = str(profile.get("对用户的称呼", "")).strip()
+            if not alias:
+                continue
+            rows.append(f"- {user_id}: {alias}")
+            if len(rows) >= max_rows:
+                break
+        return "\n".join(rows) if rows else "暂无称呼索引"
+
 
 @register("SoulMap", "柯尔", "AI驱动的用户画像收集系统，简洁设计，AI负责数据管理", "1.2.0")
 class SoulMapPlugin(Star):
@@ -372,12 +390,33 @@ class SoulMapPlugin(Star):
             pass
         return ""
 
+    def _get_group_id_safe(self, event: AstrMessageEvent) -> str:
+        try:
+            gid = event.get_group_id()
+            if gid:
+                return str(gid)
+        except Exception:
+            pass
+        try:
+            gid = getattr(getattr(event, "message_obj", None), "group_id", None)
+            if gid:
+                return str(gid)
+        except Exception:
+            pass
+        return ""
+
     def _get_contributor_label(self, event: AstrMessageEvent) -> str:
         nickname = self._get_sender_nickname(event)
         sender_id = event.get_sender_id()
         if nickname:
             return f"{nickname}/{sender_id}"
         return str(sender_id)
+
+    def _normalize_user_id(self, raw_id: str) -> str:
+        """规范化用户ID，兼容 @123、QQ123、ID:123 等格式。"""
+        text = (raw_id or "").strip().lstrip("@")
+        m = re.search(r"([1-9]\d{4,12})", text)
+        return m.group(1) if m else text
 
     def _extract_user_ids_from_text(self, text: str) -> Set[str]:
         found: Set[str] = set()
@@ -386,6 +425,41 @@ class SoulMapPlugin(Star):
                 if g:
                     found.add(g)
         return found
+
+    def _extract_proxy_target_from_event(self, event: AstrMessageEvent) -> Optional[str]:
+        """从用户原消息判断是否存在“帮他人代录”的明确目标ID。"""
+        plain_text = ""
+        try:
+            plain_text = "".join(
+                comp.text for comp in event.get_messages()
+                if isinstance(comp, Plain) and comp.text
+            )
+        except Exception:
+            pass
+        message_str = (getattr(event, "message_str", None) or "").strip()
+        outline = ""
+        try:
+            outline = event.get_message_outline() or ""
+        except Exception:
+            pass
+        merged = f"{message_str}\n{plain_text}\n{outline}".strip()
+        if not merged:
+            return None
+
+        # 只在明显的“代录/备注他人”语义下启用兜底，避免误改本人记录
+        proxy_keywords = ("代录", "帮我给", "帮我把", "帮他", "帮她", "帮ta", "给qq", "给id", "备注")
+        lower_text = merged.lower()
+        if not any(k in lower_text for k in proxy_keywords):
+            return None
+
+        ids = list(self._extract_user_ids_from_text(merged))
+        if not ids:
+            return None
+        sender_id = str(event.get_sender_id())
+        for uid in ids:
+            if uid != sender_id:
+                return uid
+        return None
 
     def _collect_related_user_ids_with_sources(
         self, event: AstrMessageEvent
@@ -499,7 +573,7 @@ class SoulMapPlugin(Star):
         head_match = re.match(r"^@?(\d{5,12})\s*(.*)$", rest, re.DOTALL)
         if not head_match:
             return None
-        target_id, body = head_match.group(1), head_match.group(2).strip()
+        target_id, body = self._normalize_user_id(head_match.group(1)), head_match.group(2).strip()
         if not body:
             return None
 
@@ -547,6 +621,8 @@ class SoulMapPlugin(Star):
         other_profiles_summary = self.manager.format_related_profiles(
             related_ids, session_id, exclude_user_id=user_id
         )
+        alias_index_summary = self.manager.format_alias_index_summary(session_id)
+        group_id = self._get_group_id_safe(event)
         allowed_fields_display = self._get_allowed_fields_display()
         max_notes_count = str(self.config.get("max_notes_count", 5))
 
@@ -562,8 +638,20 @@ class SoulMapPlugin(Star):
             sender_id=str(user_id),
             sender_nickname=sender_nickname or "未知",
             other_profiles_summary=other_profiles_summary,
+            alias_index_summary=alias_index_summary,
+            group_id=group_id or "未知",
         )
         req.system_prompt += f"\n{profile_prompt}"
+
+        # 即使用户自定义 profile_prompt，也补充一次群聊找人工具提示。
+        if group_id:
+            req.system_prompt += (
+                "\n<SoulMap群聊找人提示>\n"
+                f"当前群ID：{group_id}\n"
+                "如果用户在找人（如“谁是XX/找到XX”），请优先调用工具 get_group_members_info，"
+                "根据返回的 user_id / display_name / username 与 SoulMap 称呼索引交叉匹配，再回答。\n"
+                "</SoulMap群聊找人提示>"
+            )
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
@@ -588,7 +676,7 @@ class SoulMapPlugin(Star):
                 ops.append((m.start(), "update", None, field, value))
 
         for m in self.profile_for_pattern.finditer(original_text):
-            target_id = m.group(1).strip()
+            target_id = self._normalize_user_id(m.group(1).strip())
             for field, value in self._parse_field_pairs(m.group(2)):
                 ops.append((m.start(), "update_for", target_id, field, value))
 
@@ -609,6 +697,22 @@ class SoulMapPlugin(Star):
                 self_ops[field] = ("delete", None)
             else:
                 self_ops[field] = ("update", value)
+
+        # 兜底：若用户原话是“帮他人备注”，但模型只产出了 [Profile: ...]，
+        # 将这些更新重定向为目标用户更新，避免“自然语言代录”漏记或记到本人。
+        proxy_target_id = self._extract_proxy_target_from_event(event)
+        if proxy_target_id and not for_other:
+            migrate_fields = [
+                f for f, (op, val) in self_ops.items()
+                if op == "update" and val is not None
+            ]
+            for field in migrate_fields:
+                _, value = self_ops.pop(field)
+                for_other[(proxy_target_id, field)] = ("update", value)
+            if migrate_fields:
+                logger.info(
+                    f"[SoulMap] 代录兜底生效: 将字段 {migrate_fields} 重定向到 {proxy_target_id}"
+                )
 
         if not self_ops and not for_other:
             self._clean_profile_tags(resp, original_text)
